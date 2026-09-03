@@ -1,3 +1,6 @@
+// @author gyustar
+// @date 2026-09-03
+
 // Kafka 클라이언트 (producer + consumer 팩토리)
 //
 // Kafka는 "이벤트(사건)를 기록하고 전달하는 우체통" 같은 역할이다.

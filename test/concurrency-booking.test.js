@@ -1,3 +1,6 @@
+// @author gyustar
+// @date 2026-09-03
+
 // 좌석 동시성 테스트 — 실제 실행 중인 서버(HTTP)를 대상으로 한다.
 // concurrency-core.test.js가 SQL 자체를 검증한다면, 이건 Express 라우트를
 // 포함한 전체 요청 경로(Idempotency 체크, Redis Hold, PostgreSQL 확정)를 검증한다.

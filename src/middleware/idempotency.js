@@ -1,3 +1,6 @@
+// @author gyustar
+// @date 2026-09-03
+
 // Idempotency Check 미들웨어
 //
 // === 이게 왜 필요한지 (쉬운 설명) ===

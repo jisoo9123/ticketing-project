@@ -1,3 +1,6 @@
+// @author gyustar
+// @date 2026-09-03
+
 // Payment Consumer — booking.created 이벤트를 구독(subscribe)하는 워커
 //
 // "구독"이란 "이 채널(토픽)에 새 메시지가 올라오면 나한테 알려줘"라고

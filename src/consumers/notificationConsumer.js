@@ -1,3 +1,6 @@
+// @author gyustar
+// @date 2026-09-03
+
 // Notification Consumer — payment.completed 이벤트를 구독하는 워커
 //
 // paymentConsumer.js가 결제를 끝내고 payment.completed 이벤트를 발행하면,

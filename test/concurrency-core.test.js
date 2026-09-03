@@ -1,3 +1,6 @@
+// @author gyustar
+// @date 2026-09-03
+
 // booking.js 안에 있는 핵심 SQL이 실제로 동시성을 막아주는지,
 // Express/Redis/Kafka 없이 PostgreSQL만 놓고 직접 검증한다.
 //

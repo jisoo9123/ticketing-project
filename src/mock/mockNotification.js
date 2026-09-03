@@ -1,3 +1,6 @@
+// @author gyustar
+// @date 2026-09-03
+
 // Mock 알림 시스템
 //
 // 이것도 mockPayment.js와 같은 성격의 "가짜"다. 실제 서비스라면 여기서
