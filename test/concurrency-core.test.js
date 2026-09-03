@@ -1,19 +1,12 @@
 // @author gyustar
 // @date 2026-09-03
 
-// booking.js 안에 있는 핵심 SQL이 실제로 동시성을 막아주는지,
-// Express/Redis/Kafka 없이 PostgreSQL만 놓고 직접 검증한다.
+// booking.js의 핵심 SQL(조건부 UPDATE)이 실제 운영 스키마(seat/booking/
+// booking_seat) 기준으로도 동시성을 안전하게 막아주는지 직접 검증한다.
 //
-// booking.js와 완전히 동일한 SQL을 그대로 가져다 씀:
-//   UPDATE seats SET status='booked', updated_at=now()
-//    WHERE id=$1 AND event_id=$2 AND status='available'
-//   RETURNING id, seat_no
-//
-// 실행: PGHOST=... PGUSER=... PGPASSWORD=... node test/concurrency-core.test.js
-//
-// 알려진 이슈: CONCURRENT_REQUESTS를 늘려서 반복 실행하면 종종 0건 확정으로
-// 실패하는 케이스가 발견됨 — setupSeat()의 시드(seed) 로직 문제로 추정,
-// 아직 원인 미확정. 다음 작업자는 이 부분부터 확인할 것.
+// [2026-09-03 재작성] 기존엔 우리가 임의로 만든 seats/bookings 2테이블
+// 기준이었는데, 실제 스키마(app_user/ticket_event/seat/booking/
+// booking_seat/payment/processed_event) 기준으로 다시 짰다.
 
 const { Pool } = require('pg');
 
@@ -26,64 +19,90 @@ const pool = new Pool({
 });
 
 const CONCURRENT = parseInt(process.env.CONCURRENT_REQUESTS || '20', 10);
-const EVENT_ID = `concurrency-core-${Date.now()}`;
-const SEAT_ID = 'seat-core-1';
 
-async function setupSeat() {
-  await pool.query(
-    `INSERT INTO seats (id, event_id, seat_no, status)
-     VALUES ($1, $2, 'A1', 'available')
-     ON CONFLICT (id) DO UPDATE SET status = 'available'`,
-    [SEAT_ID, EVENT_ID]
+// 테스트에 필요한 최소 데이터(유저 1명, 이벤트 1개, 좌석 1개)를 만들어둔다.
+// FK 제약 때문에 seat -> ticket_event, booking -> app_user/ticket_event가
+// 미리 존재해야 한다.
+async function setupFixtures() {
+  const userEmail = `concurrency-test-${Date.now()}@example.com`;
+  const userResult = await pool.query(
+    `INSERT INTO app_user (email, password_hash) VALUES ($1, 'test-hash') RETURNING id`,
+    [userEmail]
   );
+  // 이 테스트는 "같은 좌석에 여러 명이 동시에" 상황을 재현해야 하므로,
+  // 실제로는 유저를 여러 명 만들어야 하지만 핵심 SQL 검증이 목적이라
+  // 여기서는 하나의 유저 id를 여러 "가상 사용자"가 공유하는 걸로 단순화한다.
+  const userId = userResult.rows[0].id;
+
+  const eventResult = await pool.query(
+    `INSERT INTO ticket_event (title, opens_at, closes_at)
+     VALUES ('동시성 테스트 이벤트', now(), now() + interval '1 day')
+     RETURNING id`
+  );
+  const eventId = eventResult.rows[0].id;
+
+  const seatResult = await pool.query(
+    `INSERT INTO seat (event_id, seat_code, status) VALUES ($1, 'A1', 'AVAILABLE') RETURNING id`,
+    [eventId]
+  );
+  const seatId = seatResult.rows[0].id;
+
+  return { userId, eventId, seatId };
 }
 
-// booking.js의 트랜잭션 블록을 그대로 재현 (BEGIN -> 조건부 UPDATE -> INSERT -> COMMIT)
-async function attemptBooking(userId) {
+// booking.js의 트랜잭션 블록을 그대로 재현한다 (실제 코드와 SQL을 동일하게 맞춰야
+// 이 테스트가 의미가 있다 — 여기서만 안전하고 실제 코드가 다르면 소용없음).
+async function attemptBooking({ userId, eventId, seatId }, idx) {
   const client = await pool.connect();
-  const bookingId = `bk-${userId}`;
+  const idempotencyKey = `concurrency-test-${idx}-${Date.now()}-${Math.random()}`;
   try {
     await client.query('BEGIN');
 
-    const updateResult = await client.query(
-      `UPDATE seats
-          SET status = 'booked', updated_at = now()
-        WHERE id = $1 AND event_id = $2 AND status = 'available'
-        RETURNING id, seat_no`,
-      [SEAT_ID, EVENT_ID]
+    const seatUpdate = await client.query(
+      `UPDATE seat
+          SET status = 'BOOKED', version = version + 1
+        WHERE id = $1 AND event_id = $2 AND status = 'AVAILABLE'
+        RETURNING id, version`,
+      [seatId, eventId]
     );
 
-    if (updateResult.rowCount === 0) {
+    if (seatUpdate.rowCount === 0) {
       await client.query('ROLLBACK');
-      return { userId, result: 'rejected', reason: 'seat_already_booked' };
+      return { idx, result: 'rejected', reason: 'seat_already_booked' };
     }
 
+    const bookingInsert = await client.query(
+      `INSERT INTO booking (user_id, event_id, idempotency_key, status)
+       VALUES ($1, $2, $3, 'CONFIRMED') RETURNING id`,
+      [userId, eventId, idempotencyKey]
+    );
+    const bookingId = bookingInsert.rows[0].id;
+
     await client.query(
-      `INSERT INTO bookings (id, event_id, seat_id, user_id, status, created_at)
-       VALUES ($1, $2, $3, $4, 'confirmed', now())`,
-      [bookingId, EVENT_ID, SEAT_ID, userId]
+      `INSERT INTO booking_seat (booking_id, seat_id) VALUES ($1, $2)`,
+      [bookingId, seatId]
     );
 
     await client.query('COMMIT');
-    return { userId, result: 'confirmed', bookingId };
+    return { idx, result: 'confirmed', bookingId };
   } catch (err) {
     await client.query('ROLLBACK');
-    return { userId, result: 'error', error: err.message };
+    return { idx, result: 'error', error: err.message };
   } finally {
     client.release();
   }
 }
 
 async function run() {
-  console.log(`[동시성 핵심 로직 테스트] 좌석 1개에 ${CONCURRENT}명이 정확히 동시에 예약을 시도합니다.`);
-  await setupSeat();
-  console.log(`좌석 준비 완료: event_id=${EVENT_ID} seat_id=${SEAT_ID}\n`);
+  console.log(`[동시성 핵심 로직 테스트 - 실제 스키마 기준] 좌석 1개에 ${CONCURRENT}명이 동시에 예약을 시도합니다.`);
 
-  const userIds = Array.from({ length: CONCURRENT }, (_, i) => `user-${i}`);
+  const fixtures = await setupFixtures();
+  console.log(`테스트 데이터 준비 완료: user_id=${fixtures.userId} event_id=${fixtures.eventId} seat_id=${fixtures.seatId}\n`);
+
+  const attempts = Array.from({ length: CONCURRENT }, (_, i) => i);
 
   const startedAt = Date.now();
-  // Promise.all로 진짜 동시에 쏜다 — 순차 실행이면 이 테스트는 의미가 없음
-  const results = await Promise.all(userIds.map(attemptBooking));
+  const results = await Promise.all(attempts.map((i) => attemptBooking(fixtures, i)));
   const elapsedMs = Date.now() - startedAt;
 
   const confirmed = results.filter((r) => r.result === 'confirmed');
@@ -92,27 +111,29 @@ async function run() {
 
   console.log(`처리 완료 (${elapsedMs}ms)\n`);
   results.forEach((r) => {
-    if (r.result === 'confirmed') console.log(`  확정: ${r.userId} -> CONFIRMED (${r.bookingId})`);
-    else if (r.result === 'rejected') console.log(`  거부: ${r.userId} -> rejected (${r.reason})`);
-    else console.log(`  오류: ${r.userId} -> error (${r.error})`);
+    if (r.result === 'confirmed') console.log(`  확정: 시도#${r.idx} -> CONFIRMED (booking_id=${r.bookingId})`);
+    else if (r.result === 'rejected') console.log(`  거부: 시도#${r.idx} -> rejected (${r.reason})`);
+    else console.log(`  오류: 시도#${r.idx} -> error (${r.error})`);
   });
 
   console.log(`\n예약 확정: ${confirmed.length}건 / 거부: ${rejected.length}건 / 오류: ${errored.length}건`);
 
+  // DB를 다시 조회해서 실제로 booking_seat에 이 좌석이 몇 번 연결됐는지 재확인.
+  // seat_id가 UNIQUE라서 원래 1개 초과로는 절대 안 들어가야 정상.
   const dbCheck = await pool.query(
-    `SELECT count(*) FROM bookings WHERE seat_id = $1 AND event_id = $2 AND status = 'confirmed'`,
-    [SEAT_ID, EVENT_ID]
+    `SELECT count(*) FROM booking_seat WHERE seat_id = $1`,
+    [fixtures.seatId]
   );
-  const dbConfirmedCount = parseInt(dbCheck.rows[0].count, 10);
-  console.log(`DB 재조회 결과 — bookings 테이블의 confirmed 건수: ${dbConfirmedCount}`);
+  const dbLinkedCount = parseInt(dbCheck.rows[0].count, 10);
+  console.log(`DB 재조회 결과 — booking_seat에 이 좌석이 연결된 건수: ${dbLinkedCount}`);
 
   console.log('\n--- 최종 판정 ---');
-  if (confirmed.length === 1 && dbConfirmedCount === 1) {
-    console.log(`PASS — 동시 요청 ${CONCURRENT}건 중 정확히 1건만 예약 확정.`);
+  if (confirmed.length === 1 && dbLinkedCount === 1) {
+    console.log(`PASS — 동시 요청 ${CONCURRENT}건 중 정확히 1건만 예약 확정 (실제 운영 스키마 기준으로도 검증됨).`);
     await pool.end();
     process.exit(0);
   } else {
-    console.log(`FAIL — confirmed=${confirmed.length}, DB=${dbConfirmedCount}. 코드 재검토 필요.`);
+    console.log(`FAIL — confirmed=${confirmed.length}, DB=${dbLinkedCount}. 코드 재검토 필요.`);
     await pool.end();
     process.exit(1);
   }

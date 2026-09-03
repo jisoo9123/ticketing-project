@@ -1,51 +1,74 @@
 // @author gyustar
 // @date 2026-09-03
 
-// Payment Consumer — booking.created 이벤트를 구독(subscribe)하는 워커
+// Payment Consumer — booking.created 이벤트를 구독하는 워커
 //
-// "구독"이란 "이 채널(토픽)에 새 메시지가 올라오면 나한테 알려줘"라고
-// Kafka에 미리 등록해두는 것이다. booking.js가 booking.created 토픽에
-// 메시지를 발행(publish)하면, 이 파일이 그걸 자동으로 받아서 처리한다.
+// [2026-09-03 재작성] 이벤트 중복 처리 방지를 Redis가 아니라 실제 스키마의
+// processed_event 테이블로 하도록 바꿨다.
 //
-// 이 파일이 하는 일 (한 문장으로): "예약 확정됐다"는 소식을 받으면
-// Mock 결제 시스템에 결제를 요청하고, 결제가 끝나면 "결제 완료됐다"는
-// 새 소식(payment.completed)을 또 발행한다.
+// 왜 이게 필요한가:
+//   Kafka는 "적어도 한 번은 전달한다(at-least-once)"는 걸 보장하지,
+//   "정확히 한 번만 전달한다"는 걸 보장하지 않는다. 즉 같은 메시지가
+//   드물게 두 번 전달될 수 있다 (네트워크 재시도, 컨슈머 재시작 등).
+//   이때 결제를 두 번 처리하면 안 되므로, "이 이벤트를 이미 처리했는가"를
+//   먼저 확인하는 절차가 필요하다 — processed_event 테이블이 그 역할.
 //
-// 이렇게 예약 확정(booking.js)과 결제 처리(여기)를 분리해둔 이유:
-// 결제 처리가 느리거나 실패해도, 이미 확정된 예약 자체는 영향받지 않게
-// 하기 위해서다. booking.js를 보면 실제로 Kafka 발행 부분이 try/catch로
-// 감싸져 있어서, 이 워커가 아예 안 떠 있어도 예약 확정 API는 정상 동작한다.
+// processed_event.event_id는 PK(UNIQUE)이므로, 같은 이벤트로 INSERT를
+// 두 번 시도하면 두 번째는 에러가 난다. 이걸 "이미 처리한 이벤트니
+// 건너뛰라"는 신호로 활용한다.
 
 const { createConsumer, publish } = require('../clients/kafkaClient');
+const pool = require('../clients/pgClient');
 const mockPayment = require('../mock/mockPayment');
 const config = require('../config');
 
+// TODO(gyustar): payment.amount가 NOT NULL인데 스키마 어디에도 좌석/이벤트
+// 가격(price) 컬럼이 없다. 실제 가격 정책이 정해질 때까지 임시 고정값을 쓴다.
+// 팀 회의에서 확인해야 하는 스키마 갭이다.
+const TEMP_FIXED_AMOUNT = 10000;
+
 async function startPaymentConsumer() {
-  // Kafka에 접속할 Consumer 하나를 만든다. 'payment'는 이 Consumer의 그룹 이름 뒷부분.
   const consumer = createConsumer('payment');
   await consumer.connect();
-  // "booking.created 토픽을 구독하겠다"고 등록한다.
-  // fromBeginning: false 는 "내가 연결된 시점 이후의 새 메시지만 받겠다"는 뜻
-  // (과거에 쌓인 메시지까지 전부 다시 처리하지 않도록).
   await consumer.subscribe({ topic: config.topics.bookingCreated, fromBeginning: false });
 
-  // run()을 호출하면 이 함수는 Kafka로부터 메시지가 올 때마다 eachMessage를 실행하며
-  // 계속 대기 상태로 돈다 (서버가 꺼질 때까지 실행되는 백그라운드 작업이라고 보면 된다).
   await consumer.run({
     eachMessage: async ({ message }) => {
-      // Kafka 메시지는 원래 이진 데이터(Buffer)라서, 문자열로 바꾼 뒤 JSON으로 해석한다.
-      // 이 event 객체 안에 booking.js가 발행했던 booking_id, seat_id 등이 들어있다.
       const event = JSON.parse(message.value.toString());
+      // processed_event.event_id는 문자열(varchar)이라, "토픽이름:booking_id" 형태로
+      // 이 메시지만의 고유 키를 만든다. booking_id 하나로도 충분히 유일하지만,
+      // 나중에 다른 토픽과 섞여도 안 헷갈리게 토픽명을 접두어로 붙여둔다.
+      const processedEventId = `${config.topics.bookingCreated}:${event.booking_id}`;
+
+      // === 먼저 "이미 처리한 적 있는지" DB에 기록을 시도한다 ===
+      // INSERT가 성공하면 = 처음 보는 이벤트 -> 아래에서 실제 결제 처리 진행
+      // INSERT가 실패하면(중복키 에러) = 이미 처리한 이벤트 -> 조용히 건너뛴다
+      try {
+        await pool.query(
+          `INSERT INTO processed_event (event_id, event_type) VALUES ($1, $2)`,
+          [processedEventId, config.topics.bookingCreated]
+        );
+      } catch (err) {
+        if (err.code === '23505') {
+          // unique_violation — 이미 처리된 이벤트. 정상적인 상황이니 에러로 취급하지 않는다.
+          console.log(`[payment-consumer] booking_id=${event.booking_id} 이미 처리된 이벤트, 건너뜀`);
+          return;
+        }
+        throw err;
+      }
 
       try {
-        // Mock 결제 시스템에 결제를 요청한다 (진짜 결제사 대신 세워둔 가짜, mockPayment.js 참고).
         const payment = await mockPayment.charge(event);
 
-        // 결제가 성공했으면, 원래 이벤트 정보에 결제 결과를 덧붙여서
-        // "payment.completed"라는 새 토픽으로 다시 발행한다.
-        // 이걸 notificationConsumer.js가 받아서 유저에게 알림을 보낸다.
+        // payment 테이블에 결제 결과를 기록한다 (booking_id는 UNIQUE라서 예약당 결제 1건).
+        await pool.query(
+          `INSERT INTO payment (booking_id, status, amount, processed_at)
+           VALUES ($1, $2, $3, now())`,
+          [event.booking_id, 'APPROVED', TEMP_FIXED_AMOUNT]
+        );
+
         await publish(config.topics.paymentCompleted, {
-          ...event, // booking_id, event_id, seat_id, user_id 등 원래 정보를 그대로 유지
+          ...event,
           payment_id: payment.payment_id,
           payment_status: payment.status,
           approved_at: payment.approved_at,
@@ -53,10 +76,6 @@ async function startPaymentConsumer() {
 
         console.log(`[payment-consumer] booking_id=${event.booking_id} 결제 완료`);
       } catch (err) {
-        // Mock 결제가 실패한 경우(mockPayment.js에서 일부러 실패시킬 수 있게 해둔 부분).
-        // 지금은 로그만 남기고 끝내지만, 나중에 실제 서비스로 갈 때는
-        // "재시도 큐로 다시 보내기"나 "실패 전용 토픽(payment.retry)으로 분리하기" 같은
-        // 보완이 필요하다 — 지금은 여기까지가 MVP 범위.
         console.error(`[payment-consumer] booking_id=${event.booking_id} 결제 실패:`, err.message);
       }
     },
