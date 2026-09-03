@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fastapi-config
+  namespace: app
+
+data:
+  # FastAPI 환경변수는 실제 애플리케이션 정보 확인 후 확정
+  APP_ENV: "<나중에-확정>"

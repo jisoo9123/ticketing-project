@@ -1,0 +1,66 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fastapi
+  namespace: app
+spec:
+  replicas: 2
+
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+
+  selector:
+    matchLabels:
+      app: fastapi
+
+  template:
+    metadata:
+      labels:
+        app: fastapi
+
+    spec:
+      containers:
+        - name: fastapi
+          image: <나중에-확정>
+          imagePullPolicy: <나중에-확정>
+
+          ports:
+            - name: http
+              containerPort: <나중에-확정>
+
+          envFrom:
+            - configMapRef:
+                name: fastapi-config
+            - secretRef:
+                name: fastapi-secret
+
+          resources:
+            requests:
+              cpu: <나중에-확정>
+              memory: <나중에-확정>
+            limits:
+              cpu: <나중에-확정>
+              memory: <나중에-확정>
+
+          livenessProbe:
+            httpGet:
+              path: <나중에-확정>
+              port: http
+
+          readinessProbe:
+            httpGet:
+              path: <나중에-확정>
+              port: http
+
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app: fastapi
