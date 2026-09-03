@@ -1,0 +1,19 @@
+{
+  "name": "ticketing-app-namespace",
+  "version": "1.0.0",
+  "description": "app namespace 구현체 — Queue/Auth/Seat/Booking + Redis/PostgreSQL/Kafka 연동",
+  "main": "src/server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "ioredis": "^5.4.1",
+    "pg": "^8.12.0",
+    "kafkajs": "^2.2.4",
+    "dotenv": "^16.4.5",
+    "uuid": "^9.0.1"
+  }
+}
