@@ -1,7 +1,7 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: fastapi
+  name: backend
   namespace: app
 spec:
   replicas: 2
@@ -14,28 +14,28 @@ spec:
 
   selector:
     matchLabels:
-      app: fastapi
+      app: backend
 
   template:
     metadata:
       labels:
-        app: fastapi
+        app: backend
 
     spec:
       containers:
-        - name: fastapi
+        - name: backend
           image: <나중에-확정>
           imagePullPolicy: <나중에-확정>
 
           ports:
             - name: http
-              containerPort: <나중에-확정>
+              containerPort: 3000
 
           envFrom:
             - configMapRef:
-                name: fastapi-config
+                name: backend-config
             - secretRef:
-                name: fastapi-secret
+                name: backend-secret
 
           resources:
             requests:
@@ -47,12 +47,12 @@ spec:
 
           livenessProbe:
             httpGet:
-              path: <나중에-확정>
+              path: /healthz
               port: http
 
           readinessProbe:
             httpGet:
-              path: <나중에-확정>
+              path: /healthz
               port: http
 
       affinity:
@@ -63,4 +63,4 @@ spec:
                 topologyKey: kubernetes.io/hostname
                 labelSelector:
                   matchLabels:
-                    app: fastapi
+                    app: backend
